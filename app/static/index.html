@@ -70,6 +70,7 @@
               <div>
                 <span className="font-semibold">Подписка:</span> {subscription.scope.toUpperCase()} #{subscription.id}
               </div>
+              {subscription.what && subscription.what.length > 0 && (
               {subscription.what?.length > 0 && (
                 <div>
                   <span className="font-semibold">Что:</span> {subscription.what.join(", ")}
@@ -225,6 +226,11 @@
               messages: history,
               draft: "",
               eventTime: "",
+              location: {
+                name: room.location && room.location.name ? room.location.name : "",
+                latitude: room.location && room.location.latitude ? room.location.latitude : "",
+                longitude: room.location && room.location.longitude ? room.location.longitude : "",
+              },
               location: { name: room.location?.name || "", latitude: room.location?.latitude || "", longitude: room.location?.longitude || "" },
             },
           }));
@@ -664,6 +670,7 @@
                           <span>{item.scope.toUpperCase()}</span>
                           <span>{item.id}</span>
                         </div>
+                        {item.what && item.what.length > 0 && <div className="mt-1">Что: {item.what.join(", ")}</div>}
                         {item.what?.length > 0 && <div className="mt-1">Что: {item.what.join(", ")}</div>}
                         {item.where && (
                           <div className="mt-1">Где: {item.where.latitude}, {item.where.longitude}{item.where.radius_km ? ` ±${item.where.radius_km}км` : ""}</div>
@@ -754,6 +761,7 @@
                           </button>
                         </div>
                         {room.description && <p className="mt-2 text-xs text-slate-400">{room.description}</p>}
+                        {room.tags && room.tags.length > 0 && <p className="mt-2 text-xs text-slate-400">#{room.tags.join(" #")}</p>}
                         {room.tags?.length > 0 && <p className="mt-2 text-xs text-slate-400">#{room.tags.join(" #")}</p>}
                         {room.location && (
                           <p className="mt-1 text-xs text-slate-500">
@@ -1006,6 +1014,9 @@
                     <div className="flex items-center justify-between">
                       <div>
                         <h3 className="text-lg font-semibold text-accent">Сеанс {sessionId}</h3>
+                        {sessionState.info && sessionState.info.topic && (
+                          <p className="text-xs text-slate-400">{sessionState.info.topic}</p>
+                        )}
                         {sessionState.info?.topic && <p className="text-xs text-slate-400">{sessionState.info.topic}</p>}
                       </div>
                     </div>
