@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Async Chat Platform</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              surface: "#0f172a",
+              panel: "#1e293b",
+              accent: "#22d3ee",
+            },
+          },
+        },
+      };
+    </script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+  </head>
+  <body class="bg-surface text-slate-100 min-h-screen">
+    <div id="root" class="max-w-7xl mx-auto py-6 px-4"></div>
+    <script type="text/babel">
+      const { useState, useEffect, useRef } = React;
+      const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const wsBase = `${wsProtocol}://${window.location.host}`;
+
+      function MessageBubble({ message }) {
+        const hasMeta = message.location || message.event_time;
+        return (
+          <div className="rounded-lg bg-panel p-3 shadow-sm">
+            <div className="flex items-center justify-between text-xs text-slate-400">
+              <span className="font-medium text-slate-200">{message.user_id}</span>
+              <span>{new Date(message.created_at).toLocaleString()}</span>
+            </div>
+            <p className="mt-2 text-sm whitespace-pre-wrap">{message.content}</p>
+            {hasMeta && (
+              <div className="mt-3 space-y-1 text-xs text-slate-300">
+                {message.event_time && (
+                  <div>
+                    <span className="font-semibold">Когда:</span> {new Date(message.event_time).toLocaleString()}
+                  </div>
+                )}
+                {message.location && (
+                  <div>
+                    <span className="font-semibold">Где:</span> {message.location.name || ""} {message.location.latitude}, {" "}
+                    {message.location.longitude}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      function NotificationCard({ item }) {
+        const { message, subscription } = item;
+        return (
+          <div className="rounded-lg border border-accent/40 bg-panel p-3 text-sm">
+            <div className="flex items-center justify-between text-xs text-accent">
+              <span>Совпадение подписки</span>
+              <span>{new Date(message.created_at).toLocaleString()}</span>
+            </div>
+            <p className="mt-2 text-slate-200">{message.content}</p>
+            <div className="mt-2 text-xs text-slate-300 space-y-1">
+              <div>
+                <span className="font-semibold">Подписка:</span> {subscription.scope.toUpperCase()} #{subscription.id}
+              </div>
+              {subscription.what && subscription.what.length > 0 && (
+                <div>
+                  <span className="font-semibold">Что:</span> {subscription.what.join(", ")}
+                </div>
+              )}
+              {subscription.where && (
+                <div>
+                  <span className="font-semibold">Где:</span> {subscription.where.latitude}, {subscription.where.longitude}
+                  {subscription.where.radius_km ? ` ±${subscription.where.radius_km}км` : ""}
+                </div>
+              )}
+              {subscription.when_start && (
+                <div>
+                  <span className="font-semibold">Когда от:</span> {new Date(subscription.when_start).toLocaleString()}
+                </div>
+              )}
+              {subscription.when_end && (
+                <div>
+                  <span className="font-semibold">Когда до:</span> {new Date(subscription.when_end).toLocaleString()}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
+
+      function App() {
+        const [inputUserId, setInputUserId] = useState(`user-${Math.random().toString(36).slice(2, 8)}`);
+        const [userId, setUserId] = useState(null);
+        const [ready, setReady] = useState(false);
+
+        const [commonMessages, setCommonMessages] = useState([]);
+        const [commonDraft, setCommonDraft] = useState("");
+        const [commonEventTime, setCommonEventTime] = useState("");
+        const [commonLocation, setCommonLocation] = useState({ name: "", latitude: "", longitude: "" });
+
+        const [rooms, setRooms] = useState([]);
+        const [roomFilters, setRoomFilters] = useState({ q: "", tags: "", latitude: "", longitude: "", radius: "", start: "", end: "" });
+        const [roomForm, setRoomForm] = useState({
+          name: "",
+          description: "",
+          tags: "",
+          topic: "",
+          locationName: "",
+          latitude: "",
+          longitude: "",
+          radius: "",
+          eventTime: "",
+        });
+        const [joinedRooms, setJoinedRooms] = useState({});
+
+        const [p2pSessions, setP2pSessions] = useState({});
+        const [p2pForm, setP2pForm] = useState({ peer: "", topic: "", sessionId: "" });
+
+        const [subscriptions, setSubscriptions] = useState([]);
+        const [subscriptionForm, setSubscriptionForm] = useState({ scope: "any", what: "", latitude: "", longitude: "", radius: "", whenStart: "", whenEnd: "", roomId: "", chatId: "" });
+        const [notifications, setNotifications] = useState([]);
+
+        const commonSocketRef = useRef(null);
+        const roomSocketsRef = useRef({});
+        const p2pSocketsRef = useRef({});
+        const subscriptionSocketRef = useRef(null);
+        const subscriptionPingRef = useRef(null);
+
+        const handleConnect = (event) => {
+          event.preventDefault();
+          if (!inputUserId.trim()) {
+            return;
+          }
+          setUserId(inputUserId.trim());
+          setReady(true);
+        };
+
+        const fetchRooms = async () => {
+          const params = new URLSearchParams();
+          if (roomFilters.q) params.append("q", roomFilters.q);
+          if (roomFilters.tags) {
+            roomFilters.tags.split(",").map((tag) => tag.trim()).filter(Boolean).forEach((tag) => params.append("tags", tag));
+          }
+          if (roomFilters.latitude && roomFilters.longitude && roomFilters.radius) {
+            params.append("latitude", roomFilters.latitude);
+            params.append("longitude", roomFilters.longitude);
+            params.append("radius_km", roomFilters.radius);
+          }
+          if (roomFilters.start) params.append("start_time", roomFilters.start);
+          if (roomFilters.end) params.append("end_time", roomFilters.end);
+          const response = await fetch(`/rooms?${params.toString()}`);
+          const data = await response.json();
+          setRooms(data);
+        };
+
+        useEffect(() => {
+          fetchRooms();
+        }, []);
+
+        useEffect(() => {
+          if (!ready) return;
+          fetch("/common/history?limit=100").then((response) => response.json()).then(setCommonMessages);
+          const socket = new WebSocket(`${wsBase}/ws/common`);
+          socket.onmessage = (event) => {
+            const payload = JSON.parse(event.data);
+            setCommonMessages((prev) => [...prev, payload]);
+          };
+          socket.onclose = () => {
+            commonSocketRef.current = null;
+          };
+          commonSocketRef.current = socket;
+          return () => {
+            socket.close();
+          };
+        }, [ready]);
+
+        useEffect(() => {
+          if (!ready || !userId) return;
+          fetch(`/subscriptions/${userId}`).then((res) => res.json()).then(setSubscriptions);
+          const socket = new WebSocket(`${wsBase}/ws/subscriptions/${userId}`);
+          socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.type === "subscription") {
+              setNotifications((prev) => [data, ...prev].slice(0, 50));
+            }
+          };
+          socket.onopen = () => {
+            subscriptionSocketRef.current = socket;
+            subscriptionPingRef.current = setInterval(() => {
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.send("ping");
+              }
+            }, 25000);
+          };
+          socket.onclose = () => {
+            subscriptionSocketRef.current = null;
+            if (subscriptionPingRef.current) {
+              clearInterval(subscriptionPingRef.current);
+            }
+          };
+          return () => {
+            socket.close();
+            if (subscriptionPingRef.current) {
+              clearInterval(subscriptionPingRef.current);
+            }
+          };
+        }, [ready, userId]);
+
+        const joinRoom = async (room) => {
+          if (!ready) return;
+          if (joinedRooms[room.id]) return;
+          const history = await fetch(`/rooms/${room.id}/history?limit=100`).then((res) => res.json());
+          setJoinedRooms((prev) => ({
+            ...prev,
+            [room.id]: {
+              room,
+              messages: history,
+              draft: "",
+              eventTime: "",
+              location: {
+                name: room.location && room.location.name ? room.location.name : "",
+                latitude: room.location && room.location.latitude ? room.location.latitude : "",
+                longitude: room.location && room.location.longitude ? room.location.longitude : "",
+              },
+            },
+          }));
+          const socket = new WebSocket(`${wsBase}/ws/rooms/${room.id}`);
+          socket.onmessage = (event) => {
+            const payload = JSON.parse(event.data);
+            setJoinedRooms((prev) => {
+              if (!prev[room.id]) return prev;
+              return {
+                ...prev,
+                [room.id]: {
+                  ...prev[room.id],
+                  messages: [...prev[room.id].messages, payload],
+                },
+              };
+            });
+          };
+          socket.onclose = () => {
+            setJoinedRooms((prev) => {
+              if (!prev[room.id]) return prev;
+              return {
+                ...prev,
+                [room.id]: {
+                  ...prev[room.id],
+                  connectionClosed: true,
+                },
+              };
+            });
+            delete roomSocketsRef.current[room.id];
+          };
+          roomSocketsRef.current[room.id] = socket;
+        };
+
+        const leaveRoom = (roomId) => {
+          if (roomSocketsRef.current[roomId]) {
+            roomSocketsRef.current[roomId].close();
+            delete roomSocketsRef.current[roomId];
+          }
+          setJoinedRooms((prev) => {
+            const clone = { ...prev };
+            delete clone[roomId];
+            return clone;
+          });
+        };
+
+        const sendCommonMessage = () => {
+          if (!commonSocketRef.current || commonSocketRef.current.readyState !== WebSocket.OPEN) return;
+          if (!commonDraft.trim()) return;
+          const payload = {
+            user_id: userId,
+            content: commonDraft,
+          };
+          if (commonEventTime) payload.event_time = commonEventTime;
+          const commonLat = parseFloat(commonLocation.latitude);
+          const commonLon = parseFloat(commonLocation.longitude);
+          if (!Number.isNaN(commonLat) && !Number.isNaN(commonLon)) {
+            payload.location = {
+              name: commonLocation.name || undefined,
+              latitude: commonLat,
+              longitude: commonLon,
+            };
+          }
+          commonSocketRef.current.send(JSON.stringify(payload));
+          setCommonDraft("");
+        };
+
+        const sendRoomMessage = (roomId) => {
+          const socket = roomSocketsRef.current[roomId];
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          const roomState = joinedRooms[roomId];
+          if (!roomState || !roomState.draft.trim()) return;
+          const payload = {
+            user_id: userId,
+            content: roomState.draft,
+          };
+          if (roomState.eventTime) payload.event_time = roomState.eventTime;
+          const roomLat = parseFloat(roomState.location.latitude);
+          const roomLon = parseFloat(roomState.location.longitude);
+          if (!Number.isNaN(roomLat) && !Number.isNaN(roomLon)) {
+            payload.location = {
+              name: roomState.location.name || undefined,
+              latitude: roomLat,
+              longitude: roomLon,
+            };
+          }
+          socket.send(JSON.stringify(payload));
+          setJoinedRooms((prev) => ({
+            ...prev,
+            [roomId]: {
+              ...prev[roomId],
+              draft: "",
+            },
+          }));
+        };
+
+        const createRoom = async (event) => {
+          event.preventDefault();
+          const payload = {
+            name: roomForm.name,
+            description: roomForm.description || undefined,
+            tags: roomForm.tags ? roomForm.tags.split(",").map((tag) => tag.trim()).filter(Boolean) : [],
+            topic: roomForm.topic || undefined,
+            location: undefined,
+            event_time: roomForm.eventTime || undefined,
+          };
+          const roomCreateLat = parseFloat(roomForm.latitude);
+          const roomCreateLon = parseFloat(roomForm.longitude);
+          if (!Number.isNaN(roomCreateLat) && !Number.isNaN(roomCreateLon)) {
+            const radiusValue = parseFloat(roomForm.radius);
+            payload.location = {
+              name: roomForm.locationName || undefined,
+              latitude: roomCreateLat,
+              longitude: roomCreateLon,
+              radius_km: !Number.isNaN(radiusValue) ? radiusValue : undefined,
+            };
+          }
+          const response = await fetch("/rooms", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (response.ok) {
+            const created = await response.json();
+            setRooms((prev) => [created, ...prev]);
+            setRoomForm({ name: "", description: "", tags: "", topic: "", locationName: "", latitude: "", longitude: "", radius: "", eventTime: "" });
+          }
+        };
+
+        const createSubscription = async (event) => {
+          event.preventDefault();
+          if (!userId) return;
+          const payload = {
+            user_id: userId,
+            scope: subscriptionForm.scope,
+            what: subscriptionForm.what ? subscriptionForm.what.split(",").map((item) => item.trim()).filter(Boolean) : [],
+            room_id: subscriptionForm.roomId || undefined,
+            chat_id: subscriptionForm.chatId || undefined,
+            when_start: subscriptionForm.whenStart || undefined,
+            when_end: subscriptionForm.whenEnd || undefined,
+          };
+          const subLat = parseFloat(subscriptionForm.latitude);
+          const subLon = parseFloat(subscriptionForm.longitude);
+          if (!Number.isNaN(subLat) && !Number.isNaN(subLon)) {
+            const radiusValue = parseFloat(subscriptionForm.radius);
+            payload.where = {
+              latitude: subLat,
+              longitude: subLon,
+              radius_km: !Number.isNaN(radiusValue) ? radiusValue : undefined,
+            };
+          }
+          const response = await fetch("/subscriptions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (response.ok) {
+            const created = await response.json();
+            setSubscriptions((prev) => [created, ...prev]);
+            setSubscriptionForm({ scope: "any", what: "", latitude: "", longitude: "", radius: "", whenStart: "", whenEnd: "", roomId: "", chatId: "" });
+          }
+        };
+
+        const createP2PSession = async (event) => {
+          event.preventDefault();
+          if (!userId || !p2pForm.peer.trim()) return;
+          const participants = Array.from(new Set([userId, ...p2pForm.peer.split(",").map((p) => p.trim()).filter(Boolean)]));
+          const payload = { participants, topic: p2pForm.topic || undefined };
+          const response = await fetch("/p2p/sessions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (response.ok) {
+            const session = await response.json();
+            openP2PSession(session.id, session);
+            setP2pForm({ peer: "", topic: "", sessionId: session.id });
+          }
+        };
+
+        const openP2PSession = async (sessionId, sessionMeta = null) => {
+          if (!sessionId) return;
+          if (p2pSessions[sessionId]) return;
+          const history = await fetch(`/p2p/${sessionId}/history?limit=100`).then((res) => res.json());
+          setP2pSessions((prev) => ({
+            ...prev,
+            [sessionId]: {
+              info: sessionMeta,
+              messages: history,
+              draft: "",
+              eventTime: "",
+              location: { name: "", latitude: "", longitude: "" },
+            },
+          }));
+          const socket = new WebSocket(`${wsBase}/ws/p2p/${sessionId}/${userId}`);
+          socket.onmessage = (event) => {
+            const payload = JSON.parse(event.data);
+            setP2pSessions((prev) => {
+              if (!prev[sessionId]) return prev;
+              return {
+                ...prev,
+                [sessionId]: {
+                  ...prev[sessionId],
+                  messages: [...prev[sessionId].messages, payload],
+                },
+              };
+            });
+          };
+          socket.onclose = () => {
+            delete p2pSocketsRef.current[sessionId];
+          };
+          p2pSocketsRef.current[sessionId] = socket;
+        };
+
+        const sendP2PMessage = (sessionId) => {
+          const socket = p2pSocketsRef.current[sessionId];
+          const sessionState = p2pSessions[sessionId];
+          if (!socket || socket.readyState !== WebSocket.OPEN || !sessionState || !sessionState.draft.trim()) return;
+          const payload = {
+            user_id: userId,
+            content: sessionState.draft,
+          };
+          if (sessionState.eventTime) payload.event_time = sessionState.eventTime;
+          const peerLat = parseFloat(sessionState.location.latitude);
+          const peerLon = parseFloat(sessionState.location.longitude);
+          if (!Number.isNaN(peerLat) && !Number.isNaN(peerLon)) {
+            payload.location = {
+              name: sessionState.location.name || undefined,
+              latitude: peerLat,
+              longitude: peerLon,
+            };
+          }
+          socket.send(JSON.stringify(payload));
+          const localMessage = {
+            id: `local-${Date.now()}`,
+            user_id: userId,
+            content: sessionState.draft,
+            created_at: new Date().toISOString(),
+            event_time: payload.event_time,
+            location: payload.location,
+          };
+          setP2pSessions((prev) => ({
+            ...prev,
+            [sessionId]: {
+              ...prev[sessionId],
+              draft: "",
+              messages: [...prev[sessionId].messages, localMessage],
+            },
+          }));
+        };
+
+        return (
+          <div className="space-y-8">
+            <header className="rounded-xl bg-panel p-6 shadow-lg">
+              <h1 className="text-2xl font-bold text-accent">Онлайн чат платформа</h1>
+              <p className="mt-2 text-sm text-slate-300">
+                Общий чат, тематические комнаты, гибкие фильтры, география и P2P беседы с подписками на события «что? где? когда?».
+              </p>
+              <form onSubmit={handleConnect} className="mt-4 flex flex-wrap items-end gap-3">
+                <label className="text-sm">
+                  <span className="block text-slate-300">Ваш идентификатор</span>
+                  <input
+                    className="mt-1 w-56 rounded-md border border-slate-600 bg-surface px-3 py-2 text-slate-100 focus:border-accent focus:outline-none"
+                    value={inputUserId}
+                    onChange={(event) => setInputUserId(event.target.value)}
+                    placeholder="user-id"
+                  />
+                </label>
+                <button
+                  type="submit"
+                  className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300"
+                >
+                  Подключиться
+                </button>
+                {userId && <span className="text-sm text-slate-400">Вы вошли как {userId}</span>}
+              </form>
+            </header>
+
+            <section className="grid gap-6 lg:grid-cols-2">
+              <div className="space-y-4">
+                <div className="rounded-xl bg-panel p-6 shadow">
+                  <h2 className="text-xl font-semibold text-accent">Общий чат</h2>
+                  <div className="mt-4 flex flex-col gap-3 max-h-72 overflow-y-auto pr-2">
+                    {commonMessages.map((message) => (
+                      <MessageBubble key={`${message.id}-${message.created_at}`} message={message} />
+                    ))}
+                    {commonMessages.length === 0 && <p className="text-sm text-slate-400">История пока пустая.</p>}
+                  </div>
+                  <div className="mt-4 space-y-3">
+                    <textarea
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      rows={3}
+                      value={commonDraft}
+                      onChange={(event) => setCommonDraft(event.target.value)}
+                      placeholder="Сообщение..."
+                    />
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      <input
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        type="datetime-local"
+                        value={commonEventTime}
+                        onChange={(event) => setCommonEventTime(event.target.value)}
+                        placeholder="Когда"
+                      />
+                      <input
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={commonLocation.name}
+                        onChange={(event) => setCommonLocation((prev) => ({ ...prev, name: event.target.value }))}
+                        placeholder="Название места"
+                      />
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          className="rounded-md border border-slate-600 bg-surface px-2 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                          value={commonLocation.latitude}
+                          onChange={(event) => setCommonLocation((prev) => ({ ...prev, latitude: event.target.value }))}
+                          placeholder="Широта"
+                        />
+                        <input
+                          className="rounded-md border border-slate-600 bg-surface px-2 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                          value={commonLocation.longitude}
+                          onChange={(event) => setCommonLocation((prev) => ({ ...prev, longitude: event.target.value }))}
+                          placeholder="Долгота"
+                        />
+                      </div>
+                    </div>
+                    <button
+                      onClick={sendCommonMessage}
+                      className="w-full rounded-md bg-accent px-4 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300 disabled:opacity-50"
+                      disabled={!ready}
+                    >
+                      Отправить
+                    </button>
+                  </div>
+                </div>
+
+                <div className="rounded-xl bg-panel p-6 shadow space-y-4">
+                  <h2 className="text-xl font-semibold text-accent">Подписки «Что? Где? Когда?»</h2>
+                  <form onSubmit={createSubscription} className="grid gap-3 sm:grid-cols-2">
+                    <label className="text-xs text-slate-400">
+                      Область
+                      <select
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.scope}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, scope: event.target.value }))}
+                      >
+                        <option value="any">Любая</option>
+                        <option value="common">Общий чат</option>
+                        <option value="room">Комнаты</option>
+                        <option value="p2p">P2P</option>
+                      </select>
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      Что (ключевые слова)
+                      <input
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.what}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, what: event.target.value }))}
+                        placeholder="концерт, meetup"
+                      />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      Широта
+                      <input
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.latitude}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, latitude: event.target.value }))}
+                        placeholder="55.75"
+                      />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      Долгота
+                      <input
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.longitude}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, longitude: event.target.value }))}
+                        placeholder="37.61"
+                      />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      Радиус (км)
+                      <input
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.radius}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, radius: event.target.value }))}
+                        placeholder="5"
+                      />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      От (время)
+                      <input
+                        type="datetime-local"
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.whenStart}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, whenStart: event.target.value }))}
+                      />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      До (время)
+                      <input
+                        type="datetime-local"
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.whenEnd}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, whenEnd: event.target.value }))}
+                      />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      Комната ID
+                      <input
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.roomId}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, roomId: event.target.value }))}
+                        placeholder="room-id"
+                      />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      P2P ID
+                      <input
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={subscriptionForm.chatId}
+                        onChange={(event) => setSubscriptionForm((prev) => ({ ...prev, chatId: event.target.value }))}
+                        placeholder="session-id"
+                      />
+                    </label>
+                    <div className="sm:col-span-2">
+                      <button
+                        type="submit"
+                        className="w-full rounded-md bg-accent px-4 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300 disabled:opacity-50"
+                        disabled={!ready}
+                      >
+                        Сохранить подписку
+                      </button>
+                    </div>
+                  </form>
+                  <div className="mt-4 space-y-2 max-h-48 overflow-y-auto pr-2">
+                    {subscriptions.map((item) => (
+                      <div key={item.id} className="rounded-md border border-slate-600 p-2 text-xs text-slate-300">
+                        <div className="flex items-center justify-between text-slate-400">
+                          <span>{item.scope.toUpperCase()}</span>
+                          <span>{item.id}</span>
+                        </div>
+                        {item.what && item.what.length > 0 && <div className="mt-1">Что: {item.what.join(", ")}</div>}
+                        {item.where && (
+                          <div className="mt-1">Где: {item.where.latitude}, {item.where.longitude}{item.where.radius_km ? ` ±${item.where.radius_km}км` : ""}</div>
+                        )}
+                        {item.when_start && <div className="mt-1">Когда от: {new Date(item.when_start).toLocaleString()}</div>}
+                        {item.when_end && <div className="mt-1">Когда до: {new Date(item.when_end).toLocaleString()}</div>}
+                      </div>
+                    ))}
+                    {subscriptions.length === 0 && <p className="text-sm text-slate-500">Подписок пока нет.</p>}
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="rounded-xl bg-panel p-6 shadow space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-xl font-semibold text-accent">Комнаты</h2>
+                    <button
+                      onClick={fetchRooms}
+                      className="rounded-md border border-accent/60 px-3 py-1 text-xs text-accent hover:bg-accent hover:text-slate-900"
+                    >
+                      Обновить список
+                    </button>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <input
+                      className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomFilters.q}
+                      onChange={(event) => setRoomFilters((prev) => ({ ...prev, q: event.target.value }))}
+                      placeholder="Поиск"
+                    />
+                    <input
+                      className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomFilters.tags}
+                      onChange={(event) => setRoomFilters((prev) => ({ ...prev, tags: event.target.value }))}
+                      placeholder="Теги"
+                    />
+                    <input
+                      className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomFilters.latitude}
+                      onChange={(event) => setRoomFilters((prev) => ({ ...prev, latitude: event.target.value }))}
+                      placeholder="Широта"
+                    />
+                    <input
+                      className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomFilters.longitude}
+                      onChange={(event) => setRoomFilters((prev) => ({ ...prev, longitude: event.target.value }))}
+                      placeholder="Долгота"
+                    />
+                    <input
+                      className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomFilters.radius}
+                      onChange={(event) => setRoomFilters((prev) => ({ ...prev, radius: event.target.value }))}
+                      placeholder="Радиус км"
+                    />
+                    <input
+                      type="datetime-local"
+                      className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomFilters.start}
+                      onChange={(event) => setRoomFilters((prev) => ({ ...prev, start: event.target.value }))}
+                    />
+                    <input
+                      type="datetime-local"
+                      className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomFilters.end}
+                      onChange={(event) => setRoomFilters((prev) => ({ ...prev, end: event.target.value }))}
+                    />
+                    <button
+                      onClick={fetchRooms}
+                      className="rounded-md bg-accent px-3 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300"
+                    >
+                      Применить
+                    </button>
+                  </div>
+                  <div className="space-y-3 max-h-72 overflow-y-auto pr-2">
+                    {rooms.map((room) => (
+                      <div key={room.id} className="rounded-lg border border-slate-700 p-3 text-sm text-slate-200">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="text-base font-semibold text-white">{room.name}</div>
+                            {room.topic && <div className="text-xs text-slate-400">{room.topic}</div>}
+                          </div>
+                          <button
+                            onClick={() => joinRoom(room)}
+                            className="rounded-md border border-accent/60 px-3 py-1 text-xs text-accent hover:bg-accent hover:text-slate-900"
+                          >
+                            Войти
+                          </button>
+                        </div>
+                        {room.description && <p className="mt-2 text-xs text-slate-400">{room.description}</p>}
+                        {room.tags && room.tags.length > 0 && <p className="mt-2 text-xs text-slate-400">#{room.tags.join(" #")}</p>}
+                        {room.location && (
+                          <p className="mt-1 text-xs text-slate-500">
+                            {room.location.name || "Локация"}: {room.location.latitude}, {room.location.longitude}
+                          </p>
+                        )}
+                        {room.event_time && <p className="mt-1 text-xs text-slate-500">Время: {new Date(room.event_time).toLocaleString()}</p>}
+                      </div>
+                    ))}
+                    {rooms.length === 0 && <p className="text-sm text-slate-500">Комнаты не найдены.</p>}
+                  </div>
+                </div>
+
+                <div className="rounded-xl bg-panel p-6 shadow">
+                  <h3 className="text-lg font-semibold text-accent">Создать комнату</h3>
+                  <form onSubmit={createRoom} className="mt-4 space-y-3">
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomForm.name}
+                      onChange={(event) => setRoomForm((prev) => ({ ...prev, name: event.target.value }))}
+                      placeholder="Название"
+                      required
+                    />
+                    <textarea
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      rows={2}
+                      value={roomForm.description}
+                      onChange={(event) => setRoomForm((prev) => ({ ...prev, description: event.target.value }))}
+                      placeholder="Описание"
+                    />
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomForm.tags}
+                      onChange={(event) => setRoomForm((prev) => ({ ...prev, tags: event.target.value }))}
+                      placeholder="Теги через запятую"
+                    />
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomForm.topic}
+                      onChange={(event) => setRoomForm((prev) => ({ ...prev, topic: event.target.value }))}
+                      placeholder="Тематика"
+                    />
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomForm.locationName}
+                      onChange={(event) => setRoomForm((prev) => ({ ...prev, locationName: event.target.value }))}
+                      placeholder="Название места"
+                    />
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={roomForm.latitude}
+                        onChange={(event) => setRoomForm((prev) => ({ ...prev, latitude: event.target.value }))}
+                        placeholder="Широта"
+                      />
+                      <input
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={roomForm.longitude}
+                        onChange={(event) => setRoomForm((prev) => ({ ...prev, longitude: event.target.value }))}
+                        placeholder="Долгота"
+                      />
+                    </div>
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={roomForm.radius}
+                      onChange={(event) => setRoomForm((prev) => ({ ...prev, radius: event.target.value }))}
+                      placeholder="Радиус (км)"
+                    />
+                    <label className="block text-xs text-slate-400">
+                      Время события
+                      <input
+                        type="datetime-local"
+                        className="mt-1 w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={roomForm.eventTime}
+                        onChange={(event) => setRoomForm((prev) => ({ ...prev, eventTime: event.target.value }))}
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="w-full rounded-md bg-accent px-4 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300"
+                    >
+                      Создать
+                    </button>
+                  </form>
+                </div>
+              </div>
+            </section>
+
+            <section className="grid gap-6 lg:grid-cols-2">
+              <div className="space-y-4">
+                {Object.values(joinedRooms).length === 0 && (
+                  <div className="rounded-xl bg-panel p-6 text-sm text-slate-400">Вы еще не присоединились ни к одной комнате.</div>
+                )}
+                {Object.entries(joinedRooms).map(([roomId, roomState]) => (
+                  <div key={roomId} className="rounded-xl bg-panel p-6 shadow space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-lg font-semibold text-accent">{roomState.room.name}</h3>
+                        <p className="text-xs text-slate-400">ID: {roomId}</p>
+                      </div>
+                      <button
+                        onClick={() => leaveRoom(roomId)}
+                        className="rounded-md border border-rose-400 px-3 py-1 text-xs text-rose-300 hover:bg-rose-400 hover:text-slate-900"
+                      >
+                        Покинуть
+                      </button>
+                    </div>
+                    <div className="max-h-64 space-y-3 overflow-y-auto pr-2">
+                      {roomState.messages.map((message) => (
+                        <MessageBubble key={`${message.id}-${message.created_at}`} message={message} />
+                      ))}
+                      {roomState.messages.length === 0 && <p className="text-sm text-slate-500">Пока нет сообщений.</p>}
+                    </div>
+                    <textarea
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      rows={2}
+                      value={roomState.draft}
+                      onChange={(event) =>
+                        setJoinedRooms((prev) => ({
+                          ...prev,
+                          [roomId]: {
+                            ...prev[roomId],
+                            draft: event.target.value,
+                          },
+                        }))
+                      }
+                      placeholder="Сообщение в комнату"
+                    />
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      <input
+                        type="datetime-local"
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={roomState.eventTime}
+                        onChange={(event) =>
+                          setJoinedRooms((prev) => ({
+                            ...prev,
+                            [roomId]: {
+                              ...prev[roomId],
+                              eventTime: event.target.value,
+                            },
+                          }))
+                        }
+                      />
+                      <input
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={roomState.location.name}
+                        onChange={(event) =>
+                          setJoinedRooms((prev) => ({
+                            ...prev,
+                            [roomId]: {
+                              ...prev[roomId],
+                              location: {
+                                ...prev[roomId].location,
+                                name: event.target.value,
+                              },
+                            },
+                          }))
+                        }
+                        placeholder="Название места"
+                      />
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          className="rounded-md border border-slate-600 bg-surface px-2 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                          value={roomState.location.latitude}
+                          onChange={(event) =>
+                            setJoinedRooms((prev) => ({
+                              ...prev,
+                              [roomId]: {
+                                ...prev[roomId],
+                                location: {
+                                  ...prev[roomId].location,
+                                  latitude: event.target.value,
+                                },
+                              },
+                            }))
+                          }
+                          placeholder="Широта"
+                        />
+                        <input
+                          className="rounded-md border border-slate-600 bg-surface px-2 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                          value={roomState.location.longitude}
+                          onChange={(event) =>
+                            setJoinedRooms((prev) => ({
+                              ...prev,
+                              [roomId]: {
+                                ...prev[roomId],
+                                location: {
+                                  ...prev[roomId].location,
+                                  longitude: event.target.value,
+                                },
+                              },
+                            }))
+                          }
+                          placeholder="Долгота"
+                        />
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => sendRoomMessage(roomId)}
+                      className="w-full rounded-md bg-accent px-4 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300"
+                    >
+                      Отправить в комнату
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <div className="space-y-4">
+                <div className="rounded-xl bg-panel p-6 shadow">
+                  <h2 className="text-xl font-semibold text-accent">P2P беседы</h2>
+                  <form onSubmit={createP2PSession} className="mt-4 space-y-3">
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={p2pForm.peer}
+                      onChange={(event) => setP2pForm((prev) => ({ ...prev, peer: event.target.value }))}
+                      placeholder="Участники через запятую"
+                      required
+                    />
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={p2pForm.topic}
+                      onChange={(event) => setP2pForm((prev) => ({ ...prev, topic: event.target.value }))}
+                      placeholder="Тема (опционально)"
+                    />
+                    <button
+                      type="submit"
+                      className="w-full rounded-md bg-accent px-4 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300"
+                    >
+                      Создать сеанс
+                    </button>
+                  </form>
+                  <div className="mt-4 space-y-2">
+                    <input
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      value={p2pForm.sessionId}
+                      onChange={(event) => setP2pForm((prev) => ({ ...prev, sessionId: event.target.value }))}
+                      placeholder="Присоединиться по ID"
+                    />
+                    <button
+                      onClick={() => openP2PSession(p2pForm.sessionId)}
+                      className="w-full rounded-md border border-accent/60 px-4 py-2 text-sm font-semibold text-accent hover:bg-accent hover:text-slate-900"
+                    >
+                      Присоединиться
+                    </button>
+                  </div>
+                </div>
+
+                {Object.entries(p2pSessions).map(([sessionId, sessionState]) => (
+                  <div key={sessionId} className="rounded-xl bg-panel p-6 shadow space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-lg font-semibold text-accent">Сеанс {sessionId}</h3>
+                        {sessionState.info && sessionState.info.topic && (
+                          <p className="text-xs text-slate-400">{sessionState.info.topic}</p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="max-h-64 space-y-3 overflow-y-auto pr-2">
+                      {sessionState.messages.map((message) => (
+                        <MessageBubble key={`${message.id}-${message.created_at}`} message={message} />
+                      ))}
+                      {sessionState.messages.length === 0 && <p className="text-sm text-slate-500">История пуста.</p>}
+                    </div>
+                    <textarea
+                      className="w-full rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                      rows={2}
+                      value={sessionState.draft}
+                      onChange={(event) =>
+                        setP2pSessions((prev) => ({
+                          ...prev,
+                          [sessionId]: {
+                            ...prev[sessionId],
+                            draft: event.target.value,
+                          },
+                        }))
+                      }
+                      placeholder="Сообщение"
+                    />
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      <input
+                        type="datetime-local"
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={sessionState.eventTime}
+                        onChange={(event) =>
+                          setP2pSessions((prev) => ({
+                            ...prev,
+                            [sessionId]: {
+                              ...prev[sessionId],
+                              eventTime: event.target.value,
+                            },
+                          }))
+                        }
+                      />
+                      <input
+                        className="rounded-md border border-slate-600 bg-surface px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                        value={sessionState.location.name}
+                        onChange={(event) =>
+                          setP2pSessions((prev) => ({
+                            ...prev,
+                            [sessionId]: {
+                              ...prev[sessionId],
+                              location: {
+                                ...prev[sessionId].location,
+                                name: event.target.value,
+                              },
+                            },
+                          }))
+                        }
+                        placeholder="Название места"
+                      />
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          className="rounded-md border border-slate-600 bg-surface px-2 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                          value={sessionState.location.latitude}
+                          onChange={(event) =>
+                            setP2pSessions((prev) => ({
+                              ...prev,
+                              [sessionId]: {
+                                ...prev[sessionId],
+                                location: {
+                                  ...prev[sessionId].location,
+                                  latitude: event.target.value,
+                                },
+                              },
+                            }))
+                          }
+                          placeholder="Широта"
+                        />
+                        <input
+                          className="rounded-md border border-slate-600 bg-surface px-2 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+                          value={sessionState.location.longitude}
+                          onChange={(event) =>
+                            setP2pSessions((prev) => ({
+                              ...prev,
+                              [sessionId]: {
+                                ...prev[sessionId],
+                                location: {
+                                  ...prev[sessionId].location,
+                                  longitude: event.target.value,
+                                },
+                              },
+                            }))
+                          }
+                          placeholder="Долгота"
+                        />
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => sendP2PMessage(sessionId)}
+                      className="w-full rounded-md bg-accent px-4 py-2 text-sm font-semibold text-slate-900 shadow hover:bg-cyan-300"
+                    >
+                      Отправить P2P
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="rounded-xl bg-panel p-6 shadow">
+              <h2 className="text-xl font-semibold text-accent">Уведомления подписок</h2>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                {notifications.map((item, index) => (
+                  <NotificationCard key={`${item.message.id}-${index}`} item={item} />
+                ))}
+                {notifications.length === 0 && <p className="text-sm text-slate-400">Соответствий пока нет.</p>}
+              </div>
+            </section>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>
