@@ -8,6 +8,7 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from .chat import CommonChat, RoomManager
 from .config import settings
 from .database import connect as connect_db
 from .database import disconnect as disconnect_db
@@ -41,6 +42,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+common_chat = CommonChat(ConnectionManager())
+room_manager = RoomManager(RoomConnectionManager())
 common_manager = ConnectionManager()
 room_manager = RoomConnectionManager()
 p2p_manager = P2PConnectionManager()
@@ -72,6 +75,7 @@ async def root() -> FileResponse:
 async def create_room(room: RoomCreate) -> RoomOut:
     """Create a chat room with extended metadata."""
 
+    return await room_manager.create(room)
     rooms = get_collection("rooms")
     document = room.model_dump()
     document["tags"] = [tag.lower() for tag in document.get("tags", [])]
@@ -92,6 +96,16 @@ async def list_rooms(
 ) -> List[RoomOut]:
     """Return rooms filtered by tags, location, or time."""
 
+    return await room_manager.list(
+        tags=tags,
+        topic=topic,
+        q=q,
+        latitude=latitude,
+        longitude=longitude,
+        radius_km=radius_km,
+        start_time=start_time,
+        end_time=end_time,
+    )
     rooms = get_collection("rooms")
     query: Dict[str, Any] = {}
     if tags:
@@ -134,6 +148,7 @@ async def list_rooms(
 async def room_history(room_id: str, limit: int = 50) -> List[MessageOut]:
     """Return history for a specific room."""
 
+    return await room_manager.history(room_id=room_id, limit=limit)
     history = await fetch_history(scope="room", room_id=room_id, limit=limit)
     return [MessageOut(**item) for item in history]
 
@@ -142,6 +157,7 @@ async def room_history(room_id: str, limit: int = 50) -> List[MessageOut]:
 async def common_history(limit: int = 50) -> List[MessageOut]:
     """Return common chat history."""
 
+    return await common_chat.history(limit=limit)
     history = await fetch_history(scope="common", limit=limit)
     return [MessageOut(**item) for item in history]
 
@@ -201,6 +217,14 @@ async def _notify_subscribers(message: Dict[str, Any]) -> None:
 async def websocket_common(websocket: WebSocket) -> None:
     """Realtime endpoint for the common chat."""
 
+    await common_chat.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            stored = await common_chat.handle_incoming(data)
+            await _notify_subscribers(stored)
+    except WebSocketDisconnect:
+        common_chat.disconnect(websocket)
     await common_manager.connect(websocket)
     try:
         while True:
@@ -221,6 +245,7 @@ async def websocket_room(websocket: WebSocket, room_id: str) -> None:
     try:
         while True:
             data = await websocket.receive_json()
+            stored = await room_manager.handle_incoming(room_id, data)
             message = MessageIn(**data)
             stored = await store_message({**message.model_dump(), "scope": "room", "room_id": room_id})
             await room_manager.broadcast(room_id, stored)
